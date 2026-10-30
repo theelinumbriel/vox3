@@ -118,6 +118,13 @@ def cmd_run(args) -> int:
     return 0
 
 
+def cmd_serve(args) -> int:
+    from .server import serve
+    print(f"vox3 serving on http://{args.host}:{args.port}  (ctrl-c to stop)")
+    serve(host=args.host, port=args.port)
+    return 0
+
+
 def cmd_sample(args) -> int:
     ckpt = Path(args.checkpoint).expanduser().resolve()
     out = Path(args.out).expanduser().resolve() if args.out else ckpt.parent / "slop.txt"
@@ -145,6 +152,11 @@ def main() -> int:
     r.add_argument("--temperature", type=float, default=0.9)
     r.add_argument("--top-k", type=int, default=40)
     r.set_defaults(func=cmd_run)
+
+    v = sub.add_parser("serve", help="launch the local browser UI (paste + drag-drop)")
+    v.add_argument("--host", default="127.0.0.1")
+    v.add_argument("--port", type=int, default=7777)
+    v.set_defaults(func=cmd_serve)
 
     s = sub.add_parser("sample", help="sample from an existing checkpoint")
     s.add_argument("checkpoint", help="path to model.pt")
