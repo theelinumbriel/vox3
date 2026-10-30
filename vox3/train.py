@@ -83,6 +83,8 @@ def train(
     warmup = max(50, iters // 20)
     min_lr = max_lr * 0.1
 
+    last_train_loss = float("nan")
+    last_val_loss = float("nan")
     t0 = time.time()
     for step in range(iters):
         lr = _lr(step, warmup, iters, max_lr, min_lr)
@@ -101,7 +103,9 @@ def train(
                 vx, vy = _batch(val_data, block_size, batch_size, device)
                 _, vloss = model(vx, vy)
             dt = time.time() - t0
-            print(f"  step {step:>5d}  train {loss.item():.3f}  val {vloss.item():.3f}  lr {lr:.2e}  {dt:.1f}s")
+            last_train_loss = float(loss.item())
+            last_val_loss = float(vloss.item())
+            print(f"  step {step:>5d}  train {last_train_loss:.3f}  val {last_val_loss:.3f}  lr {lr:.2e}  {dt:.1f}s")
             model.train()
 
     ckpt = {
@@ -113,5 +117,20 @@ def train(
     ckpt_path = run_dir / "model.pt"
     torch.save(ckpt, ckpt_path)
     (run_dir / "vocab.json").write_text(json.dumps({"stoi": stoi, "itos": {str(k): v for k, v in itos.items()}}, ensure_ascii=False))
+
+    info = {
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "corpus_bytes": corpus_path.stat().st_size,
+        "corpus_chars": len(text),
+        "vocab_size": len(stoi),
+        "params": sum(p.numel() for p in model.parameters()),
+        "config": asdict(cfg),
+        "iters": iters,
+        "train_loss": last_train_loss,
+        "val_loss": last_val_loss,
+        "wall_seconds": time.time() - t0,
+        "device": device,
+    }
+    (run_dir / "info.json").write_text(json.dumps(info, indent=2))
     print(f"  saved: {ckpt_path}")
     return ckpt_path

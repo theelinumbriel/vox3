@@ -16,9 +16,8 @@ import traceback
 from dataclasses import asdict
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from .clean import build_corpus
 from .fetch import dispatch
@@ -59,6 +58,20 @@ INDEX_HTML = r"""<!doctype html>
   .dim { color: #7d7a74; }
   .err { color: #f28b82; }
   .ok { color: #81c995; }
+  .section { margin-top: 48px; }
+  .section h2 { font-size: 15px; font-weight: 500; letter-spacing: 0.5px; color: #a09d97; margin: 0 0 12px; }
+  .model-card { background: #121216; border: 1px solid #2a2a30; border-radius: 6px; padding: 14px; margin-bottom: 10px; }
+  .model-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .model-label { font-size: 14px; color: #e8e6e3; flex: 1; min-width: 0; }
+  .model-stats { font-size: 11px; color: #7d7a74; }
+  .model-knobs { display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap; align-items: flex-end; }
+  .model-knobs label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: #7d7a74; }
+  .model-knobs input { background: #15151a; color: #e8e6e3; border: 1px solid #2a2a30; border-radius: 4px; padding: 5px 7px; font: inherit; font-size: 12px; width: 80px; }
+  .model-knobs input[type="text"] { width: 180px; }
+  .gen-btn { background: #e8e6e3; color: #0b0b0d; border: 0; border-radius: 4px; padding: 7px 14px; font: inherit; font-size: 12px; font-weight: 500; cursor: pointer; align-self: flex-end; }
+  .gen-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .gen-out { margin-top: 10px; background: #15151a; border: 1px solid #2a2a30; border-radius: 4px; padding: 12px; font-size: 13px; white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow: auto; display: none; }
+  .refresh { background: none; border: 1px solid #2a2a30; color: #a09d97; border-radius: 4px; padding: 4px 10px; font: inherit; font-size: 11px; cursor: pointer; margin: 0; }
 </style>
 </head>
 <body>
@@ -90,6 +103,14 @@ INDEX_HTML = r"""<!doctype html>
 
   <pre id="log" class="log"></pre>
   <pre id="slop" class="slop" style="display:none"></pre>
+
+  <div class="section">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <h2 style="margin:0">saved models</h2>
+      <button type="button" id="refresh" class="refresh">refresh</button>
+    </div>
+    <div id="models"></div>
+  </div>
 </div>
 
 <script>
@@ -120,6 +141,106 @@ function log(line, cls="") {
   logEl.appendChild(span);
   logEl.scrollTop = logEl.scrollHeight;
 }
+
+function fmtBytes(n) {
+  if (n == null) return "–";
+  if (n < 1024) return n + " B";
+  if (n < 1024*1024) return (n/1024).toFixed(1) + " KB";
+  return (n/1024/1024).toFixed(2) + " MB";
+}
+function fmtParams(n) {
+  if (n == null) return "–";
+  if (n < 1e6) return (n/1e3).toFixed(1) + "K";
+  return (n/1e6).toFixed(2) + "M";
+}
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+async function loadModels() {
+  const container = document.getElementById("models");
+  container.innerHTML = `<div class="dim" style="font-size:12px">loading…</div>`;
+  try {
+    const resp = await fetch("/models");
+    const models = await resp.json();
+    if (!models.length) {
+      container.innerHTML = `<div class="dim" style="font-size:12px">no saved models yet — train one above.</div>`;
+      return;
+    }
+    container.innerHTML = models.map(m => `
+      <div class="model-card" data-id="${m.id}">
+        <div class="model-head">
+          <div class="model-label">${escapeHtml(m.label || m.id)}</div>
+          <div class="model-stats">
+            ${fmtParams(m.params)} params · ${fmtBytes(m.corpus_bytes)} corpus · val ${m.val_loss?.toFixed(2) ?? "–"} · ${m.device || "?"}
+          </div>
+        </div>
+        <div class="model-stats" style="margin-top:4px">${escapeHtml(m.id)}</div>
+        <div class="model-knobs">
+          <label>length<input type="number" class="k-length" value="2000" min="100" max="20000"></label>
+          <label>temperature<input type="number" class="k-temp" step="0.05" value="0.9" min="0.1" max="2.0"></label>
+          <label>top_k<input type="number" class="k-topk" value="40" min="1" max="200"></label>
+          <label>seed (optional)<input type="text" class="k-seed" placeholder=""></label>
+          <button type="button" class="gen-btn">generate</button>
+        </div>
+        <pre class="gen-out"></pre>
+      </div>
+    `).join("");
+    container.querySelectorAll(".model-card").forEach(card => {
+      card.querySelector(".gen-btn").addEventListener("click", () => generate(card));
+    });
+  } catch (err) {
+    container.innerHTML = `<div class="err" style="font-size:12px">load failed: ${err}</div>`;
+  }
+}
+
+async function generate(card) {
+  const id = card.dataset.id;
+  const btn = card.querySelector(".gen-btn");
+  const out = card.querySelector(".gen-out");
+  btn.disabled = true;
+  out.style.display = "block";
+  out.textContent = "generating…";
+
+  const fd = new FormData();
+  fd.append("length", card.querySelector(".k-length").value);
+  fd.append("temperature", card.querySelector(".k-temp").value);
+  fd.append("top_k", card.querySelector(".k-topk").value);
+  fd.append("seed", card.querySelector(".k-seed").value);
+
+  try {
+    const resp = await fetch(`/sample/${encodeURIComponent(id)}`, { method: "POST", body: fd });
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    let gotSlop = false;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const parts = buf.split("\n\n");
+      buf = parts.pop();
+      for (const chunk of parts) {
+        const line = chunk.replace(/^data: /, "");
+        if (!line) continue;
+        if (line.startsWith("[SLOP]")) {
+          out.textContent = line.slice(6);
+          gotSlop = true;
+        } else if (line.startsWith("[ERR]")) {
+          if (!gotSlop) out.textContent = "";
+          out.textContent += line.slice(5) + "\n";
+        }
+      }
+    }
+  } catch (err) {
+    out.textContent = "fetch failed: " + err;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+document.getElementById("refresh").addEventListener("click", loadModels);
+window.addEventListener("DOMContentLoaded", loadModels);
 
 document.getElementById("f").addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -156,6 +277,7 @@ document.getElementById("f").addEventListener("submit", async (e) => {
           log(line.slice(5), "err");
         } else if (line.startsWith("[DONE]")) {
           log(line.slice(6), "ok");
+          loadModels();
         } else {
           log(line);
         }
@@ -341,6 +463,122 @@ async def run_endpoint(
 
     async def stream():
         yield f"data: [run] {run_dir.name}\n\n"
+        while True:
+            try:
+                line = q.get(timeout=0.1)
+                yield f"data: {line}\n\n"
+            except queue.Empty:
+                if not t.is_alive():
+                    while not q.empty():
+                        yield f"data: {q.get_nowait()}\n\n"
+                    return
+                await asyncio.sleep(0.1)
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+def _runs_root() -> Path:
+    return Path.cwd() / "runs"
+
+
+def _read_model_meta(run_dir: Path) -> dict | None:
+    ckpt = run_dir / "model.pt"
+    if not ckpt.exists():
+        return None
+    info_path = run_dir / "info.json"
+    spec_path = run_dir / "spec.json"
+    info = {}
+    if info_path.exists():
+        try:
+            info = json.loads(info_path.read_text())
+        except Exception:
+            info = {}
+    label = run_dir.name
+    if spec_path.exists():
+        try:
+            spec = json.loads(spec_path.read_text())
+            if spec.get("topic_summary"):
+                label = spec["topic_summary"]
+        except Exception:
+            pass
+    return {
+        "id": run_dir.name,
+        "label": label,
+        "created_at": info.get("created_at"),
+        "corpus_bytes": info.get("corpus_bytes") or (
+            (run_dir / "corpus.txt").stat().st_size if (run_dir / "corpus.txt").exists() else None
+        ),
+        "params": info.get("params"),
+        "train_loss": info.get("train_loss"),
+        "val_loss": info.get("val_loss"),
+        "iters": info.get("iters"),
+        "device": info.get("device"),
+        "ckpt_bytes": ckpt.stat().st_size,
+    }
+
+
+@app.get("/models")
+async def list_models() -> JSONResponse:
+    root = _runs_root()
+    if not root.exists():
+        return JSONResponse([])
+    models = []
+    for d in sorted(root.iterdir(), reverse=True):
+        if not d.is_dir():
+            continue
+        meta = _read_model_meta(d)
+        if meta:
+            models.append(meta)
+    return JSONResponse(models)
+
+
+@app.post("/sample/{model_id}")
+async def sample_endpoint(
+    model_id: str,
+    length: int = Form(2000),
+    temperature: float = Form(0.9),
+    top_k: int = Form(40),
+    seed: str = Form(""),
+):
+    run_dir = _runs_root() / model_id
+    ckpt = run_dir / "model.pt"
+    if not ckpt.exists():
+        raise HTTPException(status_code=404, detail="model not found")
+
+    q: queue.Queue = queue.Queue()
+
+    def worker():
+        try:
+            with contextlib.redirect_stdout(_Pipe(q)), contextlib.redirect_stderr(_Pipe(q)):
+                import torch
+                from .model import GPT, GPTConfig
+                device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+                print(f"[sample] device={device} model={model_id}")
+                blob = torch.load(ckpt, map_location=device, weights_only=False)
+                cfg = GPTConfig(**blob["config"])
+                m = GPT(cfg).to(device)
+                m.load_state_dict(blob["model"])
+                m.eval()
+                stoi = blob["stoi"]
+                itos = {int(k): v for k, v in blob["itos"].items()}
+                unk = next(iter(stoi.values()))
+                prompt = seed if seed else "\n"
+                idx = torch.tensor([[stoi.get(c, unk) for c in prompt]], dtype=torch.long, device=device)
+                out = m.generate(idx, max_new_tokens=length, temperature=temperature, top_k=top_k)
+                text = "".join(itos[int(i)] for i in out[0].tolist())
+                print(f"[sample] {len(text)} chars")
+                q.put(f"[SLOP]{text}")
+        except Exception as e:
+            tb = traceback.format_exc()
+            q.put(f"[ERR]{e}")
+            for line in tb.splitlines():
+                q.put(f"[ERR]{line}")
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+
+    async def stream():
+        yield f"data: [sample] model={model_id} temp={temperature} top_k={top_k} len={length}\n\n"
         while True:
             try:
                 line = q.get(timeout=0.1)
